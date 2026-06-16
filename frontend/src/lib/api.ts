@@ -6,7 +6,13 @@ import type {
   RewardsStatus,
 } from '../types'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+function resolveApiUrl(raw: string | undefined): string {
+  const value = (raw || 'http://localhost:8000').trim().replace(/\/$/, '')
+  if (/^https?:\/\//i.test(value)) return value
+  return `https://${value}`
+}
+
+const API_URL = resolveApiUrl(import.meta.env.VITE_API_URL)
 
 async function getAuthHeaders(): Promise<HeadersInit> {
   const user = auth.currentUser
