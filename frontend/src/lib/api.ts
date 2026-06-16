@@ -7,12 +7,26 @@ import type {
 } from '../types'
 
 function resolveApiUrl(raw: string | undefined): string {
-  const value = (raw || 'http://localhost:8000').trim().replace(/\/$/, '')
-  if (/^https?:\/\//i.test(value)) return value
-  return `https://${value}`
+  const fallback = 'http://localhost:8000'
+  let value = (raw || fallback).trim()
+  if (!value) value = fallback
+  if (!/^https?:\/\//i.test(value)) {
+    value = `https://${value.replace(/^\/+/, '')}`
+  }
+  return value.replace(/\/$/, '')
 }
 
-const API_URL = resolveApiUrl(import.meta.env.VITE_API_URL)
+const API_BASE = resolveApiUrl(import.meta.env.VITE_API_URL)
+
+/** Build an absolute API URL so GitHub Pages never treats the host as a relative path. */
+function apiUrl(path: string): string {
+  const normalizedPath = path.startsWith('/') ? path.slice(1) : path
+  return new URL(normalizedPath, `${API_BASE}/`).toString()
+}
+
+export function getApiBaseUrl(): string {
+  return API_BASE
+}
 
 async function getAuthHeaders(): Promise<HeadersInit> {
   const user = auth.currentUser
@@ -23,7 +37,7 @@ async function getAuthHeaders(): Promise<HeadersInit> {
 
 async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = await getAuthHeaders()
-  const res = await fetch(`${API_URL}${path}`, {
+  const res = await fetch(apiUrl(path), {
     ...options,
     headers: {
       ...headers,
@@ -46,7 +60,7 @@ export async function predictMood(imageBlob: Blob, notes?: string): Promise<Mood
   form.append('file', imageBlob, 'drawing.png')
   if (notes) form.append('notes', notes)
 
-  const res = await fetch(`${API_URL}/predict`, {
+  const res = await fetch(apiUrl('/predict'), {
     method: 'POST',
     headers,
     body: form,
@@ -94,7 +108,7 @@ export async function getRewardsStatus(): Promise<RewardsStatus> {
 }
 
 export async function getMoods(): Promise<{ moods: string[] }> {
-  const res = await fetch(`${API_URL}/moods`)
+  const res = await fetch(apiUrl('/moods'))
   return res.json()
 }
 
@@ -102,7 +116,7 @@ export async function checkHealth(): Promise<{
   status: string
   analyzer_ready: boolean
 }> {
-  const res = await fetch(`${API_URL}/health`)
+  const res = await fetch(apiUrl('/health'))
   return res.json()
 }
 
