@@ -8,7 +8,7 @@ from slowapi.util import get_remote_address
 
 from app.middleware.auth import AuthenticatedUser, get_current_user
 from app.models.schemas import MOOD_CATEGORIES, HistoryEntry, HistoryListResponse, MoodPrediction, RewardsStatus
-from app.services.analyzer.factory import get_analyzer
+from app.services.analyzer.factory import get_analyzer, get_analyzer_readiness
 from app.services.firebase import get_history_repository, get_rewards_repository
 from app.services.image_validation import validate_image_upload
 from app.services.storage import encode_thumbnail
@@ -30,12 +30,12 @@ async def ping():
 
 @router.get("/health")
 async def health():
-    analyzer = get_analyzer()
+    readiness = get_analyzer_readiness()
     return {
         "status": "ok",
-        "analyzer_ready": analyzer.is_ready(),
-        "analyzer_device": analyzer.get_device() if analyzer.is_ready() else None,
-        "analyzer_model": analyzer.get_model_name() if analyzer.is_ready() else None,
+        "analyzer_ready": readiness["ready"],
+        "analyzer_device": readiness["device"],
+        "analyzer_model": readiness["model"],
     }
 
 

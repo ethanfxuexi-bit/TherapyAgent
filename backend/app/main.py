@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -24,6 +25,8 @@ def _warmup_analyzer_in_background() -> None:
 
     def _run() -> None:
         try:
+            # Let Railway healthchecks pass before loading CLIP into memory.
+            time.sleep(15)
             analyzer = get_analyzer()
             if not analyzer.is_ready():
                 logger.info("Warming up mood analyzer in background...")
@@ -39,6 +42,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     logging.basicConfig(level=logging.INFO)
     init_firebase(settings)
+    logger.info("API starting on port %s (analyzer=%s)", settings.port, settings.analyzer_type)
     _warmup_analyzer_in_background()
     yield
 

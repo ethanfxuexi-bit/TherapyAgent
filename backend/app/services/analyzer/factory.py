@@ -31,3 +31,14 @@ def reset_analyzer() -> None:
     """Reset singleton — used in tests."""
     global _analyzer
     _analyzer = None
+
+
+def get_analyzer_readiness() -> dict[str, object]:
+    """Report analyzer state without creating the CLIP stack on first health check."""
+    if _analyzer is None:
+        return {"ready": False, "device": None, "model": None}
+    return {
+        "ready": _analyzer.is_ready(),
+        "device": _analyzer.get_device() if _analyzer.is_ready() else None,
+        "model": _analyzer.get_model_name() if _analyzer.is_ready() else None,
+    }
