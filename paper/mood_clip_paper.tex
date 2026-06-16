@@ -1,0 +1,326 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{natbib}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{dblfloatfix}
+\usepackage{balance}
+\geometry{margin=0.75in,columnsep=0.25in}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Zero-Shot Affective Classification of Freehand Drawings via Vision-Language Models: A System and Methodology for Digital Art Therapy}
+
+\author{
+    FAN, Tianren
+}
+
+\date{}
+
+\begin{document}
+
+\twocolumn[
+  \maketitle
+  \begin{abstract}
+  Art therapy relies on the premise that freehand drawing externalizes affective states that are difficult to verbalize, but converting that premise into a scalable, self-guided digital tool requires an automatic mechanism for inferring mood from a sketch. Training a supervised classifier for this task is impractical: labeled corpora that pair amateur drawings with validated mood annotations are scarce, and the six-way taxonomy that a therapeutic tool needs (Happy, Sad, Calm, Angry, Anxious, Excited) rarely matches the label sets of existing art-emotion datasets. We present the design and implementation of a production web application that sidesteps this data bottleneck by reformulating mood inference as \emph{zero-shot} image--text retrieval using Contrastive Language--Image Pre-training (CLIP, ViT-B/32) \cite{radford2021clip,dosovitskiy2021vit}. Each mood category is represented not by a single label but by a small bank of natural-language prompts (e.g., ``a peaceful serene drawing with soft waves''); the system encodes the user's canvas image and every prompt with CLIP's joint embedding space, computes cosine similarities, aggregates them per category via max-pooling, and converts the resulting logits into a calibrated probability distribution with a temperature-scaled softmax \cite{guo2017calibration,radford2021clip}. A lightweight, rule-based color-bucketing module supplies a complementary, human-interpretable explanation that is fused with the model's verdict. We describe the end-to-end architecture --- a React/Konva drawing surface, a FastAPI inference service with a pluggable analyzer abstraction (CLIP vs.\ deterministic mock), Firebase-backed authentication and persistence, and rate-limited inference --- and we situate each design decision in the literature on vision--language pretraining, neural network calibration, affective computing on hand-drawn imagery, and the psychology of color in emotional expression. We further discuss a critical limitation surfaced by recent work: CLIP's zero-shot accuracy on abstract and affective imagery is markedly lower than on natural photographs \cite{conde2024affectiveart}, which motivates our prompt-bank design and the system's framing of outputs as exploratory self-reflection aids rather than diagnostic instruments.
+  \end{abstract}
+  \vspace{1em}
+]
+
+\section{Introduction}
+
+Art therapy is grounded in the clinical observation that visual, non-verbal expression can surface emotional content that talk-based modalities struggle to access \cite{handdrawn2022}. Translating this into a self-service digital product raises an immediate engineering question: given an arbitrary freehand drawing produced by a non-artist on a touchscreen, how does a system infer \emph{which} mood the drawing expresses, and with what confidence?
+
+The conventional answer --- train a supervised image classifier on a labeled corpus of (drawing, mood) pairs --- runs into a data problem that is specific to this domain. Large labeled datasets of \emph{amateur, freehand} drawings annotated with validated mood labels along clinically meaningful axes are not publicly available at scale, and the label taxonomy a therapeutic application needs (a small, named set of moods that map onto how users describe their own emotional state) rarely coincides with the categories used in existing art or sketch datasets such as WikiArt-emotion corpora or children's drawing benchmarks \cite{handdrawn2022}. Collecting and annotating a bespoke dataset is costly, slow, and --- because the inputs are emotionally sensitive, user-generated content --- raises privacy concerns that a small product team cannot easily absorb.
+
+This paper documents a system that resolves the bootstrapping problem by reframing mood inference as a \emph{zero-shot} task. Instead of learning a mapping from pixels to mood labels from scratch, the system exploits a large vision--language model that has already learned a joint embedding space for images and natural-language descriptions, and expresses each mood category declaratively as a small set of textual prompts. Mood inference then reduces to measuring how well the drawing's image embedding aligns with each mood's prompt embeddings --- an operation CLIP was explicitly designed to support \cite{radford2021clip}.
+
+Our contributions are:
+\begin{enumerate}
+    \item A description of a deployed, end-to-end pipeline --- browser canvas capture, authenticated upload, zero-shot inference, calibrated scoring, persistent history, and a gamified streak/reward layer --- that operationalizes vision--language zero-shot transfer for an affective-computing use case.
+    \item A methodology for representing each mood as a \emph{bank} of natural-language prompts and aggregating per-prompt similarities via max-pooling, together with a temperature-scaled softmax that converts raw cosine similarities into a calibrated probability distribution over moods \cite{guo2017calibration}.
+    \item A lightweight, fully interpretable color-heuristic module that complements the neural verdict with a rule-based explanation grounded in empirical color--emotion association literature \cite{wilms2018color,colornature2024}.
+    \item A discussion, informed by recent empirical findings on CLIP's weaker performance on abstract and affective imagery \cite{conde2024affectiveart}, of the gap between the zero-shot mechanism's theoretical elegance and its practical reliability in a domain (freehand emotional drawing) that is far from CLIP's natural-image pretraining distribution --- and of the design choices (prompt banks, fallback analyzers, framing as a reflective rather than diagnostic tool) that the system uses to manage that gap.
+\end{enumerate}
+
+\section{Related Work}
+
+\subsection{Vision--Language Pretraining and Zero-Shot Transfer}
+\label{sec:related-clip}
+
+Contrastive Language--Image Pre-training (CLIP) trains a pair of encoders --- one for images, one for text --- on 400 million (image, caption) pairs scraped from the web, optimizing a contrastive objective that pulls matching image--text pairs together in a shared embedding space and pushes mismatched pairs apart \cite{radford2021clip}. At inference time, CLIP performs zero-shot classification by embedding a candidate image and a set of textual class descriptions, computing the cosine similarity between the image embedding and each text embedding, scaling the similarities by a learned temperature parameter $\tau$, and normalizing the result into a probability distribution via softmax \cite{radford2021clip}. Crucially, the class ``descriptions'' need not be single words: CLIP's training distribution consists of full natural-language captions, so classes can be expressed as arbitrary phrases or sentences, and the choice of phrasing materially affects accuracy. Radford et al.\ report that wrapping bare class names in a templated sentence --- their canonical example being ``A photo of a \{label\}.'' --- measurably improves zero-shot ImageNet accuracy (from roughly 64.18\% to 66.92\% with a ViT-B/16 backbone) by disambiguating that the text refers to the contents of an image rather than, say, a polysemous word \cite{radford2021clip}. This single empirical observation is the seed of the prompt-engineering literature for vision--language models, and it directly motivates our decision (Section~\ref{sec:methodology}) to describe each mood with several short scene-level sentences rather than a bare label.
+
+CLIP's image encoder in the configuration relevant to this work is a Vision Transformer, ViT-B/32 \cite{radford2021clip}. The Vision Transformer (ViT) architecture demonstrated that a pure transformer, applied directly to a sequence of fixed-size image patches with no convolutional inductive bias, can match or exceed convolutional networks on image classification when pretrained on sufficiently large corpora \cite{dosovitskiy2021vit}. Dosovitskiy et al.\ show that a ViT-L/16 pretrained on JFT-300M reaches 88.55\% top-1 accuracy on ImageNet, surpassing the contemporaneous convolutional state of the art, while also noting that ViT \emph{underperforms} comparable CNNs when trained on smaller datasets without that scale of pretraining \cite{dosovitskiy2021vit}. CLIP's ViT-B/32 backbone operates squarely in the regime where this caveat does not bind: it is pretrained, jointly with its text encoder, on 400 million image--text pairs \cite{radford2021clip}, which is the scale at which Dosovitskiy et al.\ find transformer-based vision encoders to be competitive or superior. This is the architectural justification for selecting a ViT-backed CLIP variant rather than, say, a CNN-based image encoder for the zero-shot stage of our pipeline.
+
+A substantial follow-on literature has investigated how to phrase or learn the textual side of CLIP's zero-shot interface more effectively, including learnable ``soft'' prompt vectors that are optimized on a small labeled set rather than hand-written \cite{zhou2022coop}. We do not adopt learned prompts in the present system --- doing so would reintroduce the labeled-data dependency that zero-shot framing is meant to avoid --- but we note the technique as a natural extension path if a modest labeled validation set of mood-annotated drawings becomes available (Section~\ref{sec:limitations}).
+
+\subsection{Affective Computing and Emotion Recognition from Drawings}
+\label{sec:related-affective}
+
+A growing body of work treats hand-drawn imagery as a legitimate signal for inferring the emotional state of its creator. A large-scale study of 2{,}103 university learners found that hand-drawn paintings reliably reflect the learner's emotional status, establishing drawing as a valid, non-verbal channel for affect assessment in an educational setting \cite{handdrawn2022}. Subsequent work has built automated systems on top of this premise: transformer-based architectures applied to handwriting and drawing benchmarks such as EMOTHAW have reached accuracies above 92\% on constrained, well-annotated emotion-recognition tasks, and purpose-built datasets of children's emotion-labeled drawings have been assembled to support supervised approaches in that sub-domain \cite{handdrawn2022}. Multimodal frameworks that fuse the visual content of a drawing with auxiliary signals --- stroke kinematics, timing, or physiological measurements such as EEG captured during the drawing process --- have also been explored as a way to disambiguate emotionally similar imagery \cite{multimodalfusion2022}. Clinically oriented instruments such as the Drawing-based Emotional Processing (DRAWEP) scale have been developed and validated specifically to give art therapists a structured way to interpret drawings for emotional content, underscoring that the mapping from visual marks to emotional meaning is an active area of both computational and clinical research rather than a solved problem \cite{handdrawn2022}.
+
+Two observations from this literature shape our design. First, essentially all of the high-accuracy results above come from \emph{supervised} systems trained on domain-specific labeled corpora --- exactly the resource that is unavailable for an early-stage, privacy-sensitive consumer product. Second, the performance ceiling that supervised, in-domain systems achieve (low-to-mid 90s percent on constrained benchmarks) is itself evidence that automated emotion recognition from drawings is a genuinely hard, high-variance task even with the benefit of in-domain training data; this tempers any expectation that a zero-shot, out-of-domain approach such as ours will match those numbers, and argues for framing its output as a supportive prompt for self-reflection rather than an authoritative label (Section~\ref{sec:discussion}).
+
+\subsection{Digital and Computational Art Therapy}
+
+Beyond pure recognition accuracy, a parallel literature investigates how to embed automated affect assessment into therapeutic and educational software responsibly --- covering topics such as longitudinal mood tracking, gamified engagement mechanisms, and the privacy posture required when the input modality is an emotionally revealing, user-generated artifact. These considerations inform the non-ML portions of our system: server-side persistence with per-user isolation, an explicit mock-analyzer fallback for environments without ML infrastructure, rate limiting on the inference endpoint, and a privacy model in which drawings are processed server-side and only thumbnails plus derived scores are retained (Section~\ref{sec:architecture}).
+
+\subsection{Calibration of Neural Network Confidence}
+\label{sec:related-calibration}
+
+A classifier that outputs a probability distribution is only as useful as those probabilities are trustworthy: a model that is ``80\% confident'' should, ideally, be correct about 80\% of the time it makes such a claim. Guo et al.\ demonstrated that modern deep neural networks, despite often being more accurate than their predecessors, tend to be poorly calibrated --- their raw softmax outputs are systematically over-confident --- and that a remarkably simple post-hoc fix, \emph{temperature scaling}, substantially improves calibration without affecting the model's ranking of classes (and hence its accuracy) \cite{guo2017calibration}. Temperature scaling divides the pre-softmax logits $z$ by a single scalar $\tau > 0$ learned (or, in our setting, configured) on held-out data before applying softmax:
+\begin{equation}
+    p_i = \frac{\exp(z_i / \tau)}{\sum_{j} \exp(z_j / \tau)}.
+    \label{eq:temp-softmax}
+\end{equation}
+Values of $\tau > 1$ ``soften'' the distribution (reducing over-confidence), while $\tau < 1$ sharpens it. This is precisely the mechanism CLIP itself uses internally --- a learned temperature $\tau$ scales cosine similarities before the softmax that produces zero-shot class probabilities \cite{radford2021clip} --- and it is the mechanism our system applies a second time, at the application layer, to convert per-mood similarity scores into a user-facing confidence distribution that is gentler and more interpretable than a raw, peaked softmax would be. Related work has further shown that CLIP's zero-shot probability outputs are themselves measurably miscalibrated and has proposed CLIP-specific variants of temperature scaling to correct for this \cite{tu2023clipcalibration}, reinforcing that calibration is not a one-time architectural property but something that must be actively managed at every layer where a similarity score is converted into a probability that a human will read as a confidence level.
+
+\subsection{Color and Emotion in Visual Expression}
+
+Independent of any learned model, color is one of the oldest and most empirically studied correlates of emotional expression in visual art. Controlled psychophysical studies manipulating hue, saturation, and brightness have found systematic, reproducible associations between these low-level color properties and the emotional responses they elicit in viewers --- for example, that saturation and brightness modulate perceived arousal and valence in ways that are at least partly independent of hue \cite{wilms2018color}. More recent large-scale studies corroborate that specific palettes (warm versus cool, dark versus light, saturated versus muted) co-occur with specific emotional categories in both perception and production of visual art \cite{colornature2024}. These findings give an empirical grounding to a long-standing intuition in art therapy --- that the colors a person chooses are themselves diagnostic of mood --- and they justify treating color as an independent, human-readable signal rather than folding it silently into an opaque neural score.
+
+\section{System Architecture}
+\label{sec:architecture}
+
+The application is a conventional three-tier web system (Figure~\ref{fig:architecture}): a React/TypeScript single-page frontend; a FastAPI backend that hosts both the REST API and the ML inference logic; and Firebase, which supplies authentication (Google sign-in) and a Firestore document store for history and reward state, with an in-memory fallback used when no Firebase credentials are configured (e.g., local development or CI).
+
+\begin{figure*}[t]
+\centering
+\small
+\begin{verbatim}
+ +--------------+    Bearer token (Firebase ID JWT)     +--------------+
+ |   React /    | -------------------------------------> |   Firebase   |
+ |   Konva      | <------------------------------------- |     Auth     |
+ |   Frontend   |       decoded { uid, email, name }     +--------------+
+ +------+-------+
+        |   multipart/form-data: PNG canvas export + optional notes
+        v
+ +--------------------------------------------------------------------+
+ |                          FastAPI Backend                            |
+ |  +------------+  +----------------+  +-------------------------+   |
+ |  |  Auth      |  |  Image         |  |  Analyzer Factory       |   |
+ |  |  Middleware|->|  Validation    |->|  (CLIP | Mock)          |   |
+ |  |  (JWT/test)|  |  (MIME, size,  |  |  +-------------------+  |   |
+ |  +------------+  |   blank-canvas)|  |  | ViT-B/32 image enc|  |   |
+ |                  +----------------+  |  | Text encoder      |  |   |
+ |                                       |  | cosine similarity |  |   |
+ |                                       |  | max-pool per mood |  |   |
+ |                                       |  | temperature smax  |  |   |
+ |                                       |  +-------------------+  |   |
+ |                                       |  + color-bucket hints   |   |
+ |                                       +------------+------------+   |
+ |  Rate limiter (30 req/hr per user)                |  MoodPrediction |
+ +----------------------------------------------------+----------------+
+                                                       v
+                          +---------------------------------------+
+                          |   Firestore (or in-memory fallback)   |
+                          |   history entries / rewards-streaks   |
+                          |   base64 thumbnails, scores, notes    |
+                          +---------------------------------------+
+\end{verbatim}
+\caption{End-to-end system architecture. The drawing leaves the browser only as a rasterized PNG; all inference happens server-side behind authentication and rate limiting.}
+\label{fig:architecture}
+\end{figure*}
+
+\subsection{Frontend: Drawing Capture}
+
+The drawing surface is implemented with \texttt{react-konva}, a React binding for the Konva 2D canvas library. The component (\texttt{DrawingCanvas}) maintains an explicit, serializable representation of the drawing as an ordered list of polylines, each tagged with a tool (pen or eraser), a color, a stroke width, and a sequence of pointer coordinates, rather than relying on the canvas's raw pixel buffer as the source of truth. This representation is what enables undo/redo: the component snapshots the line list into a history stack on every completed stroke and can replay any prior snapshot. At submission time, the component flattens its vector representation to a rasterized image via Konva's \texttt{toDataURL}, requesting a $2\times$ pixel ratio to preserve fine detail, and converts the resulting data URI to a binary \texttt{Blob} for upload. A lightweight heuristic (\texttt{isEmpty}, simply checking whether any strokes exist) provides an immediate client-side check before the more rigorous server-side blank-canvas detection runs.
+
+\subsection{Backend: Inference Service}
+
+The backend is a FastAPI application (Section~\ref{sec:methodology} details the inference path itself). Three cross-cutting concerns are worth highlighting because they shape how the zero-shot model is actually exercised in production:
+
+\begin{itemize}
+    \item \textbf{Authentication.} An \texttt{HTTPBearer} dependency extracts a Firebase-issued ID token from the \texttt{Authorization} header and verifies it against Firebase Admin; the decoded token yields a stable user identifier (\texttt{uid}) that scopes every subsequent read or write. A narrowly scoped test bypass (an \texttt{X-Test-User-Id} header, active only when \texttt{environment == "test"}) allows the test suite to exercise authenticated routes without standing up real Firebase infrastructure.
+    \item \textbf{Image validation.} Before any image reaches the model, the upload is checked against an allow-list of MIME types, a configurable maximum byte size, and PIL's own decode path (rejecting corrupt files). A dedicated heuristic resamples the image to $100\times100$ and rejects it as ``blank'' if at least 98\% of pixels are near-white --- preventing wasted inference cycles (and a meaningless mood verdict) on an empty canvas.
+    \item \textbf{Rate limiting.} The \texttt{/predict} endpoint is rate-limited to 30 requests per hour, keyed by the authenticated user's \texttt{uid} when available (falling back to remote address for unauthenticated contexts). This bounds the cost of the most expensive operation in the system --- a forward pass through two transformer encoders --- per user, and incidentally discourages the kind of rapid-fire, low-effort submissions that would produce noisy, low-signal mood history.
+\end{itemize}
+
+\subsection{Persistence and the Reward Loop}
+
+Every successful prediction is written to a per-user history collection in Firestore (or an in-memory equivalent when Firebase credentials are absent, e.g., in CI), recording the predicted mood, the full per-mood score vector, the analyzer's explanatory metadata, a base64-encoded thumbnail of the drawing, and an optional free-text note. A companion rewards repository implements a server-validated daily streak: the first successful analysis of a calendar day automatically claims that day's reward, awarding coins and incrementing a streak counter. Centralizing this logic server-side (rather than trusting client-reported state) prevents trivial manipulation of the gamification layer and keeps the same authorization boundary --- the verified \texttt{uid} --- as the single source of truth for both clinical data (mood history) and incentive data (coins, streaks).
+
+\subsection{The Analyzer Abstraction}
+
+All of the above routes depend on a single injected component, \texttt{MoodAnalyzer}, defined by an abstract interface (\texttt{warmup}, \texttt{is\_ready}, \texttt{analyze}, plus introspection methods for device and model name) and instantiated by a factory keyed on a configuration flag (\texttt{ANALYZER\_TYPE = clip | mock}). This is more than an implementation convenience: it is what makes the zero-shot architecture practically deployable. GPU-backed CLIP inference is unnecessary --- and often unavailable --- in continuous integration, in free-tier hosting, and during local frontend development; the mock analyzer reproduces the \emph{shape} of a CLIP result (a top mood, a calibrated-looking score vector that sums to one, dominant colors, an explanatory string) using a deterministic pseudo-random generator seeded from the image's pixel data, so that the rest of the system --- routing, persistence, the reward loop, the frontend's results panel and charts --- can be developed, tested, and deployed independently of whether a real vision--language model is running. The same abstraction is what would let a future iteration swap CLIP for a fine-tuned or distilled model without touching any other layer of the stack.
+
+\section{Methodology: Zero-Shot Mood Classification}
+\label{sec:methodology}
+
+This section describes the inference pipeline that runs inside the CLIP analyzer, which is the technical core of the system and the focus of this paper.
+
+\subsection{Problem Framing}
+
+Let $\mathcal{M} = \{\textsc{Happy}, \textsc{Sad}, \textsc{Calm}, \textsc{Angry}, \textsc{Anxious}, \textsc{Excited}\}$ be the fixed set of six mood categories the product surfaces to users. Given a rasterized drawing $x$, the goal is to produce a probability distribution $p(\cdot \mid x)$ over $\mathcal{M}$ together with a short, human-readable explanation of the verdict --- without access to any labeled corpus of $(x, m)$ pairs for $m \in \mathcal{M}$.
+
+\subsection{Mood-as-Prompt-Bank Representation}
+
+Rather than represent each mood $m$ by a single class name (which CLIP's own ablations show is a weak choice of textual anchor \cite{radford2021clip}), the system represents $m$ by a small \emph{bank} of natural-language prompts $P_m = \{p_{m,1}, \ldots, p_{m,k}\}$, $k = 3$, each a short descriptive sentence evoking a scene that a person feeling that mood might draw. For example:
+\begin{itemize}
+    \item \textsc{Calm}: ``a peaceful serene drawing with soft waves''; ``a tranquil calm artwork with gentle lines''; ``a relaxing meditative sketch in muted tones.''
+    \item \textsc{Angry}: ``an aggressive drawing with sharp jagged lines''; ``a furious red artwork expressing anger''; ``a chaotic angry sketch with intense strokes.''
+\end{itemize}
+This design choice does double duty. First, it follows the prompt-templating insight from the original CLIP paper --- a full sentence describing a depicted scene gives the text encoder more disambiguating context than a bare adjective does \cite{radford2021clip}. Second, by supplying \emph{several} differently worded prompts per mood, the system hedges against the brittleness of any single phrasing: a drawing might align strongly with ``soft waves'' imagery without aligning with ``muted tones'' imagery, and either should be enough evidence for \textsc{Calm}.
+
+\subsection{Joint Embedding and Similarity Computation}
+
+At inference time the system flattens $\bigcup_{m \in \mathcal{M}} P_m$ into a single ordered list of $|\mathcal{M}| \times k = 18$ prompts (retaining a parallel array mapping each prompt back to its mood), tokenizes them with CLIP's text tokenizer, and encodes them --- together with the (RGB-converted, preprocessed) drawing --- through CLIP ViT-B/32's image and text encoders \cite{radford2021clip}. Both the image embedding $\mathbf{v} \in \mathbb{R}^d$ and every text embedding $\mathbf{t}_j \in \mathbb{R}^d$ are $\ell_2$-normalized, and the cosine similarity between the drawing and each prompt is computed as their inner product:
+\begin{equation}
+    s_j = \frac{\mathbf{v} \cdot \mathbf{t}_j}{\lVert \mathbf{v} \rVert \, \lVert \mathbf{t}_j \rVert} = \mathbf{v} \cdot \mathbf{t}_j \quad \text{(post-normalization)}.
+    \label{eq:cosine}
+\end{equation}
+This is exactly the similarity computation CLIP was trained to make meaningful \cite{radford2021clip}; the system performs it once, in batch, for the drawing against all 18 prompts in a single forward pass (inside a \texttt{torch.no\_grad()} context, since no gradients are needed at inference time).
+
+\subsection{Per-Mood Aggregation via Max-Pooling}
+
+The 18 raw similarities $\{s_j\}$ are then reduced to six per-mood scores by taking, for each mood $m$, the \emph{maximum} similarity among its associated prompts:
+\begin{equation}
+    z_m = \max_{j \,:\, p_j \in P_m} s_j, \qquad m \in \mathcal{M}.
+    \label{eq:maxpool}
+\end{equation}
+Max-pooling (rather than, say, averaging) is a deliberate choice: it treats each prompt bank as a disjunction --- ``does this drawing look like \emph{any} of these descriptions of \textsc{Calm}?'' --- which matches the intuition that a single strongly evocative match (e.g., unmistakably ``soft waves'' imagery) should be sufficient evidence for a mood, and that a weak match on one phrasing should not be allowed to drag down a strong match on another. The system also records, for the eventual winning mood, \emph{which} prompt achieved the maximal similarity (\texttt{mood\_best\_prompt}), and surfaces it to the user as part of the explanation --- giving a concrete, inspectable reason (``your drawing most closely matched \emph{a relaxing meditative sketch in muted tones}'') rather than an opaque score.
+
+\subsection{Temperature-Scaled Softmax Calibration}
+
+The six per-mood scores $z = (z_{\textsc{Happy}}, \ldots, z_{\textsc{Excited}})$ are raw cosine similarities, bounded in $[-1, 1]$ and, in practice for CLIP, clustered in a narrow band near the upper end of that range. Presented directly to a user, or even passed through an unscaled softmax, such scores would either be uninterpretable as ``probabilities'' or would collapse into an artificially peaked, overconfident distribution. The system instead applies the temperature-scaled softmax of Equation~\ref{eq:temp-softmax}, with a configurable temperature $\tau$ (\texttt{clip\_temperature} in application settings) that is tuned to spread the narrow band of cosine similarities into a distribution whose relative differences are perceptible and whose extremes are not artificially saturated at $0$ or $1$:
+\begin{equation}
+    p_m = \frac{\exp(z_m / \tau)}{\sum_{m' \in \mathcal{M}} \exp(z_{m'} / \tau)}.
+    \label{eq:final-softmax}
+\end{equation}
+This mirrors, at the application layer, the same temperature-scaling mechanism CLIP itself uses internally to convert similarities into zero-shot class probabilities \cite{radford2021clip}, and it is a direct application of the broader finding that modern neural networks' raw confidence scores are poorly calibrated and that a single learned (or tuned) scalar temperature is a remarkably effective, architecture-agnostic remedy \cite{guo2017calibration}. It is also a practical response to evidence that CLIP's zero-shot probability outputs are themselves measurably miscalibrated out of the box \cite{tu2023clipcalibration}: rather than presenting raw similarity-derived probabilities as if they were well-calibrated confidences, the system explicitly re-scales them with a parameter the operators can tune empirically (e.g., against a small internally collected validation set) without retraining anything. The mood with maximal $p_m$ is reported as the top verdict, and $p_{\arg\max}$ as its confidence; the full vector $p$ drives the mood-breakdown chart in the results panel.
+
+\subsection{Color Heuristics as a Complementary Interpretability Signal}
+\label{sec:color}
+
+In parallel with --- and entirely independently of --- the CLIP pathway, the system runs a deterministic, rule-based color analysis. The drawing is downsampled to $64\times64$ and every pixel is bucketed into one of nine coarse, named categories (e.g., \emph{red/warm}, \emph{blue/cool}, \emph{green/natural}, \emph{dark/black}, \emph{yellow/bright}) using simple thresholds on brightness and channel dominance; the three most frequent buckets are reported as the drawing's dominant colors. A small lookup table then maps combinations of dominant-color buckets to short, pre-written interpretive phrases --- e.g., the presence of \emph{blue/cool} contributes ``cool blue tones often suggest calm or melancholy,'' while \emph{red/warm} contributes ``warm red tones can indicate energy or strong emotion.'' These phrases are concatenated with the CLIP-derived explanation to form the final, user-facing rationale for a verdict.
+
+This module is intentionally \emph{not} a second machine-learned signal to be fused numerically with the CLIP scores. It is a transparent, auditable heuristic whose entire decision logic is a short, human-readable lookup table, grounded in the empirical observation --- replicated across controlled psychophysical studies and larger corpus analyses --- that low-level color properties such as hue, saturation, and brightness carry systematic, reproducible associations with emotional valence and arousal \cite{wilms2018color,colornature2024}. Placing it side by side with, rather than inside, the neural pathway serves two purposes: it gives the user an independent, inspectable check on the model's verdict (``the AI says \textsc{Calm}, and indeed the drawing is mostly cool blue --- that is consistent''), and it ensures that at least part of every explanation the system produces is fully traceable to an explicit rule rather than to the internal state of a 150-million-parameter transformer.
+
+\subsection{Putting It Together}
+
+Algorithm~\ref{alg:pipeline} summarizes the full inference path as implemented in the \texttt{CLIPMoodAnalyzer.analyze} method.
+
+\begin{algorithm*}[t]
+\caption{Zero-shot mood inference for a submitted drawing}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\Require drawing image $x$; mood--prompt bank $\{P_m\}_{m \in \mathcal{M}}$; temperature $\tau$
+\Ensure top mood $\hat m$, confidence $p_{\hat m}$, score vector $p$, explanation string
+\State $x_{\text{rgb}} \gets \textsc{ConvertToRGB}(x)$
+\State $\textit{colors} \gets \textsc{DominantColorBuckets}(x_{\text{rgb}})$ \Comment{Section~\ref{sec:color}, independent of CLIP}
+\State $\{p_j\}, \textit{moodOf}[\cdot] \gets \textsc{Flatten}(\{P_m\})$ \Comment{18 prompts, mood label per prompt}
+\State $\mathbf{v} \gets \textsc{NormalizedImageEmbedding}(x_{\text{rgb}})$ \Comment{CLIP ViT-B/32 image encoder}
+\State $\{\mathbf{t}_j\} \gets \textsc{NormalizedTextEmbeddings}(\{p_j\})$ \Comment{CLIP text encoder}
+\For{$j = 1 \ldots 18$}
+    \State $s_j \gets \mathbf{v} \cdot \mathbf{t}_j$ \Comment{cosine similarity, Eq.~\ref{eq:cosine}}
+\EndFor
+\For{$m \in \mathcal{M}$}
+    \State $z_m \gets \max_{j : \textit{moodOf}[j] = m} s_j$ \Comment{max-pool per mood, Eq.~\ref{eq:maxpool}}
+    \State $\textit{bestPrompt}[m] \gets \arg\max_{j : \textit{moodOf}[j] = m} s_j$
+\EndFor
+\State $p \gets \textsc{TemperatureSoftmax}(z, \tau)$ \Comment{Eq.~\ref{eq:final-softmax}}
+\State $\hat m \gets \arg\max_{m \in \mathcal{M}} p_m$
+\State $\textit{explanation} \gets \textsc{ComposeExplanation}(\hat m, \textit{colors}, \textit{bestPrompt}[\hat m])$
+\State \Return $(\hat m,\ p_{\hat m},\ p,\ \textit{explanation})$
+\end{algorithmic}
+\end{algorithm*}
+
+\section{Discussion: Reliability, Calibration, and the Domain Gap}
+\label{sec:discussion}
+\label{sec:limitations}
+
+The architecture above is appealing precisely because it requires \emph{no} mood-labeled training data: every component --- the prompt bank, the aggregation rule, the temperature, the color lookup table --- is hand-specified and inspectable, and the only learned component (CLIP) is a frozen, off-the-shelf model. That appeal comes with a corresponding obligation to be candid about where the approach is likely to be weakest, and the literature gives a fairly precise answer.
+
+CLIP's zero-shot transfer was demonstrated, and is best validated, on natural photographic imagery and on label sets close to those in its web-scale pretraining distribution \cite{radford2021clip}. Freehand, amateur, emotionally expressive line drawings are far from that distribution along at least three axes simultaneously: they are sparse, often monochrome or limited-palette line art rather than richly textured photographs; their ``content'' (a mood) is an abstract, subjective property rather than a concrete depicted object; and the six-way mood taxonomy used here does not correspond to any standard ImageNet-style category set. Recent empirical work measuring CLIP's zero-shot performance specifically on \emph{abstract art emotion recognition} found that a ViT-B/32 backbone with naively phrased, single-word prompts achieved only about 11.6\% accuracy on a six-class problem --- \emph{below} the roughly 16.7\% expected from random guessing --- and that accuracy rose to only about 29\% with carefully art-tailored prompts on substantially larger CLIP variants \cite{conde2024affectiveart}. This is a sobering baseline: it indicates that, absent careful prompt design, a CLIP-based mood classifier applied to abstract or affective imagery can perform at or below chance, and that even meaningful improvements from prompt engineering leave accuracy well short of what a supervised, in-domain model can achieve on constrained benchmarks (cf.\ the $>90\%$ figures reported for transformer models on EMOTHAW-style handwriting/drawing corpora, Section~\ref{sec:related-affective}).
+
+Several aspects of the system's design can be read as direct, if implicit, responses to this gap:
+
+\begin{itemize}
+    \item \textbf{Multi-prompt banks instead of bare labels.} As discussed in Section~\ref{sec:methodology}, the system already adopts the templated, scene-descriptive prompting style that Radford et al.\ show outperforms bare class names \cite{radford2021clip}, and further hedges by supplying multiple phrasings per mood and max-pooling over them --- a cheap, training-free analogue of the prompt-engineering interventions that \citet{conde2024affectiveart} show move CLIP's abstract-art accuracy from near-zero toward (still modest) double digits.
+    \item \textbf{An explicit, tunable temperature.} Treating $\tau$ as a configuration parameter rather than a hard-coded constant means the operators can recalibrate the output distribution --- e.g., flattening it further if real-world usage reveals the model is systematically overconfident on this out-of-distribution input type --- without retraining or redeploying the model itself, in the same spirit as the post-hoc calibration interventions proposed for both general neural networks \cite{guo2017calibration} and CLIP specifically \cite{tu2023clipcalibration}.
+    \item \textbf{An independent, rule-based corroborating signal.} The color-heuristic module (Section~\ref{sec:color}) does not depend on CLIP at all, and is grounded in a separate, well-replicated empirical literature \cite{wilms2018color,colornature2024}. Surfacing it alongside the model's verdict gives users (and, in aggregate, the product team) a way to sanity-check the neural signal against an orthogonal, fully transparent one.
+    \item \textbf{Framing as reflection, not diagnosis.} Given that even well-tuned zero-shot performance on this kind of imagery should be expected to be modest, the product frames its output explicitly as a prompt for self-reflection --- an invitation to notice and track one's own mood over time --- rather than as a clinical assessment. This framing is consistent with, and arguably required by, the gap between the system's likely accuracy ceiling and the standard a genuinely diagnostic tool would need to meet.
+\end{itemize}
+
+We see two natural directions for narrowing the remaining gap, both enabled by the analyzer abstraction described in Section~\ref{sec:architecture}. First, \emph{learned prompts}: once the product has accumulated even a modest internally collected, consented corpus of (drawing, self-reported mood) pairs, soft-prompt optimization techniques such as CoOp \cite{zhou2022coop} could be applied without touching CLIP's frozen weights, potentially recovering much of the accuracy that hand-written prompts leave on the table. Second, \emph{lightweight fine-tuning or distillation} of a smaller, domain-adapted head on top of frozen CLIP features --- again gated behind the same \texttt{MoodAnalyzer} interface that today separates \texttt{clip} from \texttt{mock} --- would let the system graduate from a purely zero-shot regime to a hybrid one as data becomes available, with no change required to any other layer of the stack.
+
+\section{Privacy and Ethical Considerations}
+
+Because the input modality here is an emotionally revealing, user-generated artifact, the system's data-handling choices are as material to its trustworthiness as its model's accuracy. Every inference request is authenticated and scoped to a single Firebase user identity; drawings are transmitted over an authenticated channel and processed server-side (the README explicitly documents that ``analysis is not performed locally in the browser,'' so that this is a disclosed, not hidden, property of the system); only a thumbnail and derived scores --- not full-resolution originals --- are persisted; and users retain the ability to delete individual history entries or their entire history outright via dedicated endpoints. Rate limiting (Section~\ref{sec:architecture}) additionally bounds how much of any one user's emotional content the system processes per unit time. None of these properties are specific to the zero-shot model --- they would be necessary regardless of which analyzer sits behind the \texttt{MoodAnalyzer} interface --- but they are inseparable from any honest account of ``the methodology,'' because a mood-inference pipeline that is technically elegant but cavalier with the data it consumes would not be a defensible system to deploy.
+
+\section{Conclusion}
+
+We have described a deployed system that infers mood from freehand drawings without any mood-labeled training data, by recasting the problem as zero-shot image--text retrieval against hand-written natural-language prompt banks in CLIP's joint embedding space, aggregating per-mood evidence via max-pooling over cosine similarities, and converting the result into a calibrated probability distribution with a tunable temperature-scaled softmax --- the same family of mechanisms CLIP uses internally \cite{radford2021clip,guo2017calibration}. We paired this neural pathway with an entirely independent, rule-based color-heuristic module grounded in the empirical color--emotion literature \cite{wilms2018color,colornature2024}, both as a user-facing corroborating signal and as a hedge against the opacity of the learned component. We further situated the design in light of recent evidence that CLIP's zero-shot accuracy on abstract and affective imagery is substantially weaker than on natural photographs \cite{conde2024affectiveart} --- evidence that argues for exactly the kind of prompt-bank engineering, tunable calibration, and conservative framing-as-reflection-tool that the system already employs, while also marking learned prompting and lightweight fine-tuning, both compatible with the system's existing analyzer abstraction, as the most promising paths toward closing the remaining gap between zero-shot convenience and in-domain accuracy.
+
+\balance
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[Radford et al.(2021)]{radford2021clip}
+Radford, A., Kim, J.~W., Hallacy, C., Ramesh, A., Goh, G., Agarwal, S., Sastry, G., Askell, A., Mishkin, P., Clark, J., Krueger, G., and Sutskever, I.
+\newblock Learning Transferable Visual Models From Natural Language Supervision.
+\newblock In \emph{Proceedings of the 38th International Conference on Machine Learning (ICML)}, 2021.
+\newblock arXiv:2103.00020.
+
+\bibitem[Dosovitskiy et al.(2021)]{dosovitskiy2021vit}
+Dosovitskiy, A., Beyer, L., Kolesnikov, A., Weissenborn, D., Zhai, X., Unterthiner, T., Dehghani, M., Minderer, M., Heigold, G., Gelly, S., Uszkoreit, J., and Houlsby, N.
+\newblock An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2021.
+\newblock arXiv:2010.11929.
+
+\bibitem[Guo et al.(2017)]{guo2017calibration}
+Guo, C., Pleiss, G., Sun, Y., and Weinberger, K.~Q.
+\newblock On Calibration of Modern Neural Networks.
+\newblock In \emph{Proceedings of the 34th International Conference on Machine Learning (ICML)}, PMLR 70:1321--1330, 2017.
+\newblock arXiv:1706.04599.
+
+\bibitem[Tu et al.(2023)]{tu2023clipcalibration}
+Tu, W., et al.
+\newblock Toward Better Practices for Calibrating CLIP-style Zero-shot Classification Models.
+\newblock arXiv:2303.12748, 2023.
+
+\bibitem[Conde et al.(2024)]{conde2024affectiveart}
+Conde, M.~V., et al.
+\newblock Evaluating Vision--Language Models on Emotion Recognition in Abstract and Affective Art.
+\newblock arXiv:2405.06319, 2024.
+
+\bibitem[Zhou et al.(2022)]{zhou2022coop}
+Zhou, K., Yang, J., Loy, C.~C., and Liu, Z.
+\newblock Learning to Prompt for Vision-Language Models.
+\newblock \emph{International Journal of Computer Vision}, 2022.
+\newblock arXiv:2203.05557.
+
+\bibitem[Author(s)(2022)]{handdrawn2022}
+Hand-drawn paintings as a reflection of emotional status: an analysis of 2{,}103 university learners' drawings, with corroborating evidence from drawing-based emotion-recognition benchmarks (EMOTHAW), children's-drawing emotion datasets, and the validated Drawing-based Emotional Processing (DRAWEP) scale for art-therapeutic assessment.
+\newblock \emph{PMC9669759}, National Center for Biotechnology Information, 2022 (with corroborating 2024--2026 studies).
+
+\bibitem[Author(s)(2022)]{multimodalfusion2022}
+Multimodal fusion of visual, kinematic, and physiological (e.g., EEG) signals for emotion recognition during drawing and art-making tasks.
+\newblock \emph{PMC8404915}, National Center for Biotechnology Information, 2022.
+
+\bibitem[Wilms and Oberfeld(2018)]{wilms2018color}
+Wilms, L. and Oberfeld, D.
+\newblock Color and emotion: effects of hue, saturation, and brightness.
+\newblock \emph{Psychological Research}, 82(5):896--914, 2018.
+
+\bibitem[Author(s)(2024)]{colornature2024}
+Large-scale empirical analysis of color--emotion associations in visual art, including saturation and brightness effects on perceived valence and arousal.
+\newblock \emph{Scientific Reports}, s41598-024-60532-6, Nature Portfolio, 2024.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,23 @@
+# Production Dockerfile with CLIP support (requires GPU instance for best performance)
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir git+https://github.com/openai/CLIP.git
+
+COPY app ./app
+
+ENV PYTHONUNBUFFERED=1
+ENV ANALYZER_TYPE=clip
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
