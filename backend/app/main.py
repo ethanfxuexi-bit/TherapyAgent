@@ -1,4 +1,5 @@
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -16,22 +17,29 @@ from app.services.firebase import init_firebase
 logger = logging.getLogger(__name__)
 
 
+def _warmup_analyzer_in_background() -> None:
+    settings = get_settings()
+    if settings.environment == "test":
+        return
+
+    def _run() -> None:
+        try:
+            analyzer = get_analyzer()
+            if not analyzer.is_ready():
+                logger.info("Warming up mood analyzer in background...")
+                analyzer.warmup()
+        except Exception as e:
+            logger.error("Analyzer warmup failed: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     logging.basicConfig(level=logging.INFO)
     init_firebase(settings)
-
-    # Warm up analyzer in background for non-test envs
-    if settings.environment != "test":
-        try:
-            analyzer = get_analyzer()
-            if not analyzer.is_ready():
-                logger.info("Warming up mood analyzer...")
-                analyzer.warmup()
-        except Exception as e:
-            logger.error("Analyzer warmup failed: %s", e)
-
+    _warmup_analyzer_in_background()
     yield
 
 

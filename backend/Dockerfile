@@ -5,15 +5,20 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# CPU-only PyTorch — Railway hobby instances do not have GPUs.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir git+https://github.com/openai/CLIP.git
 
 COPY app ./app
 
 ENV PYTHONUNBUFFERED=1
-ENV ANALYZER_TYPE=mock
+ENV ANALYZER_TYPE=clip
+ENV CLIP_MODEL=ViT-B/32
 ENV ENVIRONMENT=production
 ENV PORT=8000
 
